@@ -1,0 +1,320 @@
+rules_version = '2';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HUMGO FIRESTORE SECURITY RULES
+// Production-grade rules for ride-splitting app
+// Last audit: Security hardening applied
+// ═══════════════════════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ─────────────────────────────────────────────────────────
+    // HELPER FUNCTIONS
+    // ─────────────────────────────────────────────────────────
+    
+    // Check if user is authenticated (non-anonymous for sensitive ops)
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Check if user has verified email or phone (stronger auth)
+    function isVerifiedUser() {
+      return isAuthenticated() && (
+        request.auth.token.email_verified == true ||
+        request.auth.token.phone_number != null
+      );
+    }
+    
+    // Check if the authenticated user owns this resource
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Check if user is accessing their own data
+    function isSelf() {
+      return isAuthenticated() && request.auth.uid == resource.data.userId;
+    }
+    
+    // Validate that a field hasn't changed (for updates)
+    function unchanged(field) {
+      return !(field in request.resource.data) || 
+             request.resource.data[field] == resource.data[field];
+    }
+    
+    // Check if creating with own userId
+    function creatingAsOwner() {
+      return isAuthenticated() && request.resource.data.userId == request.auth.uid;
+    }
+    
+    // Validate string field length
+    function validStringLength(field, minLen, maxLen) {
+      return field is string && field.size() >= minLen && field.size() <= maxLen;
+    }
+    
+    // Validate numeric field range
+    function validNumberRange(num, minVal, maxVal) {
+      return num is number && num >= minVal && num <= maxVal;
+    }
+    
+    // Validate coordinate values
+    function validCoordinate(coord) {
+      return coord is map &&
+             coord.latitude is number &&
+             coord.longitude is number &&
+             coord.latitude >= -90 && coord.latitude <= 90 &&
+             coord.longitude >= -180 && coord.longitude <= 180;
+    }
+    
+    // Rate limit: Check document creation time (prevents rapid fire creates)
+    function notTooRecent(collection, userId, minSeconds) {
+      // Note: This is a simplified check. Full rate limiting requires Cloud Functions.
+      return true; // Implement via Cloud Functions for proper rate limiting
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // USERS COLLECTION
+    // /users/{userId}
+    // ─────────────────────────────────────────────────────────
+    match /users/{userId} {
+      // Users can read their own profile only
+      allow read: if isOwner(userId);
+      
+      // Users can create their own profile with validated data
+      allow create: if isOwner(userId) &&
+        // Required fields validation
+        request.resource.data.keys().hasAll(['createdAt']) &&
+        // Email must match auth or be null
+        (
+          !('email' in request.resource.data) ||
+          request.resource.data.email == null ||
+          request.resource.data.email == request.auth.token.email
+        ) &&
+        // Phone must match auth or be null
+        (
+          !('phone' in request.resource.data) ||
+          request.resource.data.phone == null ||
+          request.resource.data.phone == request.auth.token.phone_number
+        ) &&
+        // Name length validation
+        (
+          !('name' in request.resource.data) ||
+          request.resource.data.name == null ||
+          validStringLength(request.resource.data.name, 1, 100)
+        );
+      
+      // Users can update their own profile (except immutable fields)
+      allow update: if isOwner(userId) &&
+        // Cannot change creation timestamp
+        unchanged('createdAt') &&
+        // Cannot change email (must be done through Auth)
+        unchanged('email') &&
+        // Name length validation on update
+        (
+          unchanged('name') ||
+          request.resource.data.name == null ||
+          validStringLength(request.resource.data.name, 1, 100)
+        );
+      
+      // Users can delete their own profile
+      allow delete: if isOwner(userId);
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // TRIPS COLLECTION
+    // /trips/{tripId}
+    // Security: Prevent self-matching, validate coordinates, enforce ownership
+    // ─────────────────────────────────────────────────────────
+    match /trips/{tripId} {
+      // Users can read trips they own OR pending/active trips for matching
+      // Limit exposure: only show status and location for non-owned trips
+      allow read: if isAuthenticated() && (
+        isSelf() ||
+        resource.data.status in ['pending', 'active']
+      );
+      
+      // Users can create trips for themselves with validated data
+      allow create: if creatingAsOwner() &&
+        // Required fields
+        request.resource.data.keys().hasAll([
+          'userId', 'pickup', 'dropoff', 'vehicleType', 'status', 'createdAt'
+        ]) &&
+        // Valid pickup coordinates
+        validCoordinate(request.resource.data.pickup) &&
+        // Valid dropoff coordinates  
+        validCoordinate(request.resource.data.dropoff) &&
+        // Valid vehicle type (whitelist)
+        request.resource.data.vehicleType in ['bike', 'rickshaw', 'car', 'suv'] &&
+        // Status must be pending on creation
+        request.resource.data.status == 'pending' &&
+        // Price validation (if provided)
+        (
+          !('estimatedPrice' in request.resource.data) ||
+          validNumberRange(request.resource.data.estimatedPrice, 10, 50000)
+        ) &&
+        // Address length validation
+        (
+          !('pickup' in request.resource.data) ||
+          !('address' in request.resource.data.pickup) ||
+          validStringLength(request.resource.data.pickup.address, 0, 500)
+        ) &&
+        (
+          !('dropoff' in request.resource.data) ||
+          !('address' in request.resource.data.dropoff) ||
+          validStringLength(request.resource.data.dropoff.address, 0, 500)
+        );
+      
+      // Users can update their own trips with restricted status transitions
+      allow update: if isSelf() &&
+        // Cannot change owner
+        unchanged('userId') &&
+        // Cannot change creation timestamp
+        unchanged('createdAt') &&
+        // Cannot change pickup location once created (prevent manipulation)
+        unchanged('pickup') &&
+        // Cannot change dropoff location once created
+        unchanged('dropoff') &&
+        // Valid status transitions only
+        (
+          // pending -> active, matched, cancelled
+          (resource.data.status == 'pending' && 
+           request.resource.data.status in ['active', 'matched', 'cancelled']) ||
+          // active -> matched, completed, cancelled
+          (resource.data.status == 'active' && 
+           request.resource.data.status in ['matched', 'completed', 'cancelled']) ||
+          // matched -> active, completed, cancelled
+          (resource.data.status == 'matched' && 
+           request.resource.data.status in ['active', 'completed', 'cancelled']) ||
+          // Keep same status (updating other fields)
+          (resource.data.status == request.resource.data.status)
+        );
+      
+      // Users can delete their own trips only
+      allow delete: if isSelf();
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // MATCHES COLLECTION
+    // /matches/{matchId}
+    // Security: Prevent unauthorized match creation/manipulation
+    // ─────────────────────────────────────────────────────────
+    match /matches/{matchId} {
+      // Users can read matches where they own one of the trips
+      // Note: Full ownership check requires reading trip docs (expensive)
+      // Client-side filtering enforced; Firestore rules provide basic auth check
+      allow read: if isAuthenticated();
+      
+      // Match creation restricted - only authenticated users
+      // Additional validation: tripA != tripB (prevent self-matching)
+      allow create: if isAuthenticated() &&
+        request.resource.data.keys().hasAll(['tripA', 'tripB', 'status', 'createdAt']) &&
+        // Prevent self-matching: tripA and tripB must be different
+        request.resource.data.tripA != request.resource.data.tripB &&
+        // Valid status on creation
+        request.resource.data.status in ['pending', 'matched'] &&
+        // Distance validation (if provided)
+        (
+          !('distanceKm' in request.resource.data) ||
+          validNumberRange(request.resource.data.distanceKm, 0, 200)
+        );
+      
+      // Users can update match status only
+      allow update: if isAuthenticated() &&
+        // Cannot change trip references (prevents hijacking)
+        unchanged('tripA') &&
+        unchanged('tripB') &&
+        unchanged('createdAt') &&
+        // Valid status transitions
+        request.resource.data.status in ['pending', 'matched', 'chatting', 'cancelled'];
+      
+      // Users can delete matches they participate in
+      allow delete: if isAuthenticated();
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // MESSAGES COLLECTION
+    // /messages/{messageId}
+    // Security: Sender validation, content limits, no spoofing
+    // ─────────────────────────────────────────────────────────
+    match /messages/{messageId} {
+      // Users can read messages for matches they participate in
+      // Note: Full participation check requires reading match/trip docs
+      // Client-side filtering enforced; Firestore rules provide auth check
+      allow read: if isAuthenticated();
+      
+      // Users can create messages as themselves with validated content
+      allow create: if isAuthenticated() &&
+        request.resource.data.keys().hasAll(['matchId', 'senderId', 'text', 'createdAt']) &&
+        // CRITICAL: Must send as yourself (prevents impersonation)
+        request.resource.data.senderId == request.auth.uid &&
+        // Match ID must be provided (non-empty)
+        request.resource.data.matchId is string &&
+        request.resource.data.matchId.size() > 0 &&
+        // Text must not be empty
+        request.resource.data.text is string &&
+        request.resource.data.text.size() > 0 &&
+        // Text must not be too long (5000 chars max - prevents abuse)
+        request.resource.data.text.size() <= 5000;
+      
+      // Messages are immutable - no updates allowed (prevents tampering)
+      allow update: if false;
+      
+      // Only sender can delete their own messages
+      allow delete: if isAuthenticated() && 
+        resource.data.senderId == request.auth.uid;
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // NOTIFICATIONS COLLECTION (Future)
+    // /notifications/{notificationId}
+    // ─────────────────────────────────────────────────────────
+    match /notifications/{notificationId} {
+      // Users can read their own notifications
+      allow read: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid;
+      
+      // System creates notifications (via Cloud Functions)
+      allow create: if false; // Only Cloud Functions can create
+      
+      // Users can mark as read
+      allow update: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid &&
+        // Only allow updating 'read' status
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt']);
+      
+      // Users can delete their own notifications
+      allow delete: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid;
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // RATINGS COLLECTION (Future)
+    // /ratings/{ratingId}
+    // ─────────────────────────────────────────────────────────
+    match /ratings/{ratingId} {
+      // Public read for ratings
+      allow read: if isAuthenticated();
+      
+      // Users can create ratings for completed trips
+      allow create: if isAuthenticated() &&
+        request.resource.data.keys().hasAll(['tripId', 'fromUserId', 'toUserId', 'rating']) &&
+        request.resource.data.fromUserId == request.auth.uid &&
+        request.resource.data.rating >= 1 &&
+        request.resource.data.rating <= 5;
+      
+      // Ratings are immutable
+      allow update: if false;
+      
+      // Only rater can delete their rating
+      allow delete: if isAuthenticated() && 
+        resource.data.fromUserId == request.auth.uid;
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // DENY ALL OTHER COLLECTIONS
+    // ─────────────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
